@@ -30,4 +30,5 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           FOOTBALL_CHAT_ID: ${{ secrets.FOOTBALL_CHAT_ID }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SHEET_CSV_URL: ${{ secrets.SHEET_CSV_URL }}
           HANDOVER_STATE: ${{ github.event.inputs.state }}
