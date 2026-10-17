@@ -1,62 +1,71 @@
 #!/usr/bin/env python3
 """
-Goal alerts: ESPN public scoreboard feed (free, no key)  ->  Telegram.
+Goal alerts: API-Football  ->  Telegram.  Works on the FREE plan (100 requests/day)
+and automatically polls faster on paid plans.
 
-* Reads today's tracked matches from tracked_matches.csv (export of your sheet).
-* Links each match to an ESPN event (per-league fuzzy team-name matching).
-* Polls only the leagues that have a tracked match in play (kick-off -10min .. +3h),
-  every POLL_SECONDS, and compares scores.
-* Telegram message the moment a tracked score goes up; scorer added when ESPN lists it.
-* GitHub jobs are capped at 6h, so the script hands its state to a fresh run of the
-  same workflow (workflow_dispatch) before the cap - no gaps, no duplicates.
-
-NOTE: ESPN's feed is unofficial/undocumented. The parser is defensive, and the
-'tracker started' message reports how many events ESPN returned per league.
+How the free budget is stretched
+* ONE request per check (fixtures?live=all) - never one request per match.
+* Checks only happen while a tracked match can be in play (kick-off -2min .. +2h05).
+* The gap between checks is recalculated every time:
+      seconds of match-time still ahead / API requests still left today
+  so the whole day's requests are spread across the whole day (~every 5-6 min on 100/day).
+* Scorers come from the same live response (no extra request per goal).
+* A finished match costs one batched lookup for its final score.
 """
-import csv, html, json, logging, os, re, sys, threading, time, unicodedata
-from concurrent.futures import ThreadPoolExecutor
+import csv, html, json, logging, os, re, threading, time, unicodedata
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 
 import requests
 
-ESPN_URL = "https://site.api.espn.com/apis/site/v2/sports/soccer/{lg}/scoreboard"
-HEADERS = {"User-Agent": "Mozilla/5.0 (personal goal-alert bot)"}
+API_BASE = "https://v3.football.api-sports.io"
+API_KEY = os.environ.get("API_FOOTBALL_KEY", "")
 TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT = os.environ.get("FOOTBALL_CHAT_ID", "")
-POLL = float(os.environ.get("POLL_SECONDS", "20"))
+MIN_POLL = float(os.environ.get("MIN_POLL_SECONDS", "20"))     # fastest allowed (paid plans)
+MAX_POLL = float(os.environ.get("MAX_POLL_SECONDS", "600"))    # slowest allowed
+DAILY_LIMIT = int(os.environ.get("DAILY_LIMIT", "100"))        # used only if the API sends no header
+RESERVE = int(os.environ.get("RESERVE_REQUESTS", "10"))        # kept back for final-score lookups
 MAX_RUN = float(os.environ.get("MAX_RUNTIME_MIN", "340")) * 60
 CSV_PATH = os.environ.get("CSV_PATH", "tracked_matches.csv")
 CSV_UTC_OFFSET = float(os.environ.get("CSV_UTC_OFFSET_HOURS", "0"))
 FT_ALERTS = os.environ.get("FT_ALERTS", "1") == "1"
 MIN_SIDE, MIN_AVG = 0.78, 0.82
-
-# sheet "League" text  ->  ESPN league code (extend / override as needed)
-LEAGUES = {"premier league": "eng.1", "championship": "eng.2", "efl championship": "eng.2",
-           "la liga": "esp.1", "bundesliga": "ger.1", "serie a": "ita.1", "ligue 1": "fra.1",
-           "eredivisie": "ned.1", "primeira liga": "por.1", "mls": "usa.1"}
-try:
-    LEAGUES.update({k.lower(): v for k, v in json.loads(os.environ.get("LEAGUE_MAP", "{}")).items()})
-except ValueError:
-    pass
+FINAL = {"FT", "AET", "PEN", "AWD", "WO", "PST", "CANC", "ABD"}
 
 log = logging.getLogger("goals")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
+_used = {"n": 0}
+_remaining = {"v": None}
 
 # ------------------------------------------------------------------ helpers
-def fetch_board(lg, day, tries=3):
+def api_get(path, params=None, tries=3):
     for i in range(tries):
+        _used["n"] += 1
+        r = None
         try:
-            r = requests.get(ESPN_URL.format(lg=lg), headers=HEADERS, timeout=10,
-                             params={"dates": day.strftime("%Y%m%d"), "limit": 100})
+            r = requests.get(f"{API_BASE}/{path}", params=params,
+                             headers={"x-apisports-key": API_KEY}, timeout=10)
+            _remaining["v"] = r.headers.get("x-ratelimit-requests-remaining", _remaining["v"])
+            if r.status_code in (401, 403):
+                raise PermissionError(f"HTTP {r.status_code} - check the API_FOOTBALL_KEY secret")
             if r.status_code == 429:
                 time.sleep(5 * (i + 1)); continue
             r.raise_for_status()
-            return r.json().get("events", []) or []
+            data = r.json()
+            if data.get("errors"):
+                raise RuntimeError(f"API error: {data['errors']}")
+            return data
+        except (PermissionError, RuntimeError):
+            raise
         except Exception as e:
             if i == tries - 1:
                 raise
-            time.sleep(2 * (i + 1))
+            log.warning("api retry (%s)", e); time.sleep(2 * (i + 1))
+
+def budget_left():
+    v = _remaining["v"]
+    return int(v) if v is not None and str(v).isdigit() else max(0, DAILY_LIMIT - _used["n"])
 
 def tg_send(text):
     try:
@@ -66,14 +75,6 @@ def tg_send(text):
         return r.json()["result"]["message_id"]
     except Exception as e:
         log.error("telegram send failed: %s", e)
-
-def tg_edit(msg_id, text):
-    try:
-        requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/editMessageText",
-                      json={"chat_id": TG_CHAT, "message_id": msg_id, "text": text,
-                            "parse_mode": "HTML", "disable_web_page_preview": True}, timeout=10)
-    except Exception as e:
-        log.error("telegram edit failed: %s", e)
 
 # ------------------------------------------------------- name normalisation
 STOP = {"fc", "afc", "cf", "cfc", "sc", "sv", "fsv", "vfb", "vfl", "tsv", "ac", "as", "ssc",
@@ -106,49 +107,13 @@ def sim(a, b):
                        SequenceMatcher(None, x, y).ratio())
     return best
 
-def best_event(home, away, events):
+def best_fixture(home, away, fixtures):
     best, score = None, 0
-    for e in events:
-        h, a = sim(home, e["home"]), sim(away, e["away"])
+    for f in fixtures:
+        h = sim(home, f["teams"]["home"]["name"]); a = sim(away, f["teams"]["away"]["name"])
         if h >= MIN_SIDE and a >= MIN_SIDE and (h + a) / 2 >= MIN_AVG and (h + a) > score:
-            best, score = e, h + a
+            best, score = f, h + a
     return best
-
-# ------------------------------------------------------------ ESPN parsing
-def parse(ev):
-    try:
-        comp = (ev.get("competitions") or [{}])[0]
-        side = {c.get("homeAway"): c for c in comp.get("competitors", [])}
-        h, a = side["home"], side["away"]
-        st = ev.get("status") or comp.get("status") or {}
-        typ = st.get("type") or {}
-        score = lambda c: int(float(c.get("score") or 0))
-        name = lambda c: (c.get("team") or {}).get("displayName") or (c.get("team") or {}).get("name") or ""
-        return {"id": str(ev["id"]), "home": name(h), "away": name(a), "hs": score(h), "as": score(a),
-                "state": typ.get("state", ""), "tname": typ.get("name", ""),
-                "clock": st.get("displayClock") or typ.get("shortDetail") or "",
-                "details": comp.get("details") or []}
-    except Exception as e:
-        log.warning("could not parse event %s: %s", ev.get("id"), e)
-        return None
-
-def minute(e):
-    if e["tname"] == "STATUS_HALFTIME":
-        return "HT"
-    return e["clock"]
-
-def last_goal_text(details):
-    plays = [d for d in details if d.get("scoringPlay") or "goal" in ((d.get("type") or {}).get("text", "").lower())]
-    if not plays:
-        return None
-    d = plays[-1]
-    ath = (d.get("athletesInvolved") or [{}])[0]
-    who = ath.get("displayName") or ath.get("shortName")
-    if not who:
-        return None
-    t = ((d.get("type") or {}).get("text") or "").lower()
-    tag = " [own goal]" if "own" in t else " [pen]" if "penalty" in t else ""
-    return f"👤 {html.escape(who)}{tag}"
 
 # ------------------------------------------------------------ tracked list
 def load_tracked(path, day):
@@ -170,62 +135,74 @@ def load_tracked(path, day):
     return out
 
 def resolve(tracked, day):
-    codes = sorted({LEAGUES[m["league"].lower()] for m in tracked if m["league"].lower() in LEAGUES})
-    boards, counts = {}, {}
-    for lg in codes:
-        try:
-            boards[lg] = [p for p in (parse(e) for e in fetch_board(lg, day)) if p]
-        except Exception as e:
-            log.error("scoreboard %s failed: %s", lg, e); boards[lg] = []
-        counts[lg] = len(boards[lg])
+    fx = api_get("fixtures", {"date": day.isoformat()})["response"]
     matched, missing = {}, []
     for m in tracked:
-        lg = LEAGUES.get(m["league"].lower())
-        e = best_event(m["home"], m["away"], boards.get(lg, [])) if lg else None
-        if e:
-            matched[e["id"]] = {**m, "lg": lg, "home": e["home"], "away": e["away"]}
+        f = best_fixture(m["home"], m["away"], fx)
+        if f:
+            matched[f["fixture"]["id"]] = {**m, "league": f["league"]["name"],
+                                           "home": f["teams"]["home"]["name"],
+                                           "away": f["teams"]["away"]["name"]}
         else:
-            missing.append(f'{m["home"]} v {m["away"]}' + ("" if lg else f' (unknown league "{m["league"]}")'))
-    return matched, missing, counts
+            missing.append(f'{m["home"]} v {m["away"]}')
+    return matched, missing
+
+# ------------------------------------------------- budget-aware scheduling
+def windows(matched, done):
+    w = sorted((m["kickoff"] - timedelta(minutes=2), m["kickoff"] + timedelta(minutes=125))
+               for i, m in matched.items() if i not in done)
+    merged = []
+    for s, e in w:
+        if merged and s <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+        else:
+            merged.append((s, e))
+    return merged
+
+def active_left(merged, now):
+    return sum(max(0.0, (e - max(s, now)).total_seconds()) for s, e in merged)
+
+def next_interval(merged, now):
+    budget = max(1, budget_left() - RESERVE)
+    return min(MAX_POLL, max(MIN_POLL, active_left(merged, now) / budget))
 
 # ----------------------------------------------------------------- alerts
-def enrich(mid, base, lg, day, eid):
-    for wait in (20, 45):
-        time.sleep(wait)
-        try:
-            for e in fetch_board(lg, day):
-                p = parse(e)
-                if p and p["id"] == eid:
-                    txt = last_goal_text(p["details"])
-                    if txt:
-                        tg_edit(mid, base + "\n" + txt); return
-        except Exception as ex:
-            log.warning("enrich failed: %s", ex)
+def minute(f):
+    st = f["fixture"]["status"]
+    return "HT" if st.get("short") == "HT" else (f"{st['elapsed']}'" if st.get("elapsed") else "")
 
-def goal_alert(e, info, prev, cur, day):
+def goal_events(f):
+    return [e for e in (f.get("events") or []) if e.get("type") == "Goal"
+            and "Missed" not in (e.get("detail") or "")]
+
+def goal_alert(f, info, prev, cur):
     home, away = html.escape(info["home"]), html.escape(info["away"])
-    if cur[0] > prev[0] and cur[1] > prev[1]:
-        who = "both teams"
+    n = max(1, (cur[0] + cur[1]) - (prev[0] + prev[1]))
+    if n > 1:
+        title = f"{n} NEW GOALS"
     else:
-        who = home if cur[0] > prev[0] else away
-    text = (f"⚽ <b>GOAL — {who}!</b>\n{html.escape(info['league'])}\n"
-            f"{home} <b>{cur[0]} – {cur[1]}</b> {away}   ⏱ {minute(e)}")
-    scorer = last_goal_text(e["details"])
-    mid = tg_send(text + ("\n" + scorer if scorer else ""))
+        title = "GOAL — " + ("both teams" if cur[0] > prev[0] and cur[1] > prev[1]
+                             else home if cur[0] > prev[0] else away)
+    text = (f"⚽ <b>{title}!</b>\n{html.escape(info['league'])}\n"
+            f"{home} <b>{cur[0]} – {cur[1]}</b> {away}   ⏱ {minute(f)}")
+    for e in goal_events(f)[-n:]:
+        tag = {"Own Goal": " [own goal]", "Penalty": " [pen]"}.get(e.get("detail"), "")
+        who = (e.get("player") or {}).get("name") or "?"
+        text += f"\n👤 {(e.get('time') or {}).get('elapsed', '?')}' {html.escape(who)}{tag} ({html.escape((e.get('team') or {}).get('name', ''))})"
+    tg_send(text)
     log.info("GOAL %s %s-%s %s", info["home"], cur[0], cur[1], info["away"])
-    if mid and not scorer:
-        threading.Thread(target=enrich, args=(mid, text, info["lg"], day, e["id"]), daemon=True).start()
 
 def correction_alert(info, prev, cur):
     tg_send(f"🚫 <b>Score corrected</b> (goal disallowed?)\n{html.escape(info['home'])} "
             f"<b>{cur[0]} – {cur[1]}</b> {html.escape(info['away'])}   (was {prev[0]} – {prev[1]})")
 
 # ------------------------------------------------------------- handover
-def handover(scores, done):
+def handover(scores, done, seen):
     repo, tok = os.environ.get("GITHUB_REPOSITORY"), os.environ.get("GITHUB_TOKEN")
     if not (repo and tok):
         log.error("no GitHub env - cannot hand over"); return
-    state = json.dumps({"scores": scores, "done": sorted(done)})
+    state = json.dumps({"scores": {str(k): v for k, v in scores.items()},
+                        "done": sorted(done), "seen": sorted(seen), "used": _used["n"]})
     r = requests.post(
         f"https://api.github.com/repos/{repo}/actions/workflows/"
         f"{os.environ.get('WORKFLOW_FILE', 'goal-alerts.yml')}/dispatches",
@@ -240,85 +217,87 @@ def main():
     if os.environ.get("TRACK_DATE"):
         day = datetime.strptime(os.environ["TRACK_DATE"], "%Y-%m-%d").date()
     state = json.loads(os.environ.get("HANDOVER_STATE") or "{}")
+    _used["n"] = state.get("used", 0)
     tracked = load_tracked(CSV_PATH, day)
     if not tracked:
         log.info("No tracked matches for %s - nothing to do.", day); return
-    matched, missing, counts = resolve(tracked, day)
+    try:
+        matched, missing = resolve(tracked, day)
+    except Exception as e:
+        tg_send(f"❌ <b>Goal tracker could not start</b>\n{html.escape(str(e))}")
+        raise
+    done = set(state.get("done", [])); seen = set(state.get("seen", []))
+    scores = {int(k): tuple(v) for k, v in state.get("scores", {}).items()}
     if not state:
-        msg = f"✅ <b>Goal tracker started</b> — {len(matched)}/{len(tracked)} matches linked.\n"
-        msg += "ESPN events found: " + ", ".join(f"{k}: {v}" for k, v in counts.items())
+        iv = next_interval(windows(matched, done), datetime.now(timezone.utc))
+        msg = (f"✅ <b>Goal tracker started</b> — {len(matched)}/{len(tracked)} matches linked.\n"
+               f"API requests left today: {budget_left()} · checking about every {iv/60:.1f} min")
         if missing:
-            msg += "\n⚠️ Not linked:\n" + "\n".join(html.escape(m) for m in missing)
+            msg += "\n⚠️ Not found in feed:\n" + "\n".join(html.escape(m) for m in missing)
         tg_send(msg)
     if not matched:
         return
-    scores = {k: tuple(v) for k, v in state.get("scores", {}).items()}
-    done = set(state.get("done", []))
     silent = not state
-    first_ko = min(m["kickoff"] for m in matched.values())
-    last_ko = max(m["kickoff"] for m in matched.values())
+    miss_strikes, warned = {}, False
 
-    while not state and datetime.now(timezone.utc) < first_ko - timedelta(minutes=10):
-        if time.time() - start > MAX_RUN:
-            handover({}, done); return
-        time.sleep(30)
-
-    polls, fails = 0, 0
     while True:
         t0 = time.time()
         now = datetime.now(timezone.utc)
         pending = {i for i in matched if i not in done}
-        if not pending or now > last_ko + timedelta(hours=3, minutes=30):
+        merged = windows(matched, done)
+        if not pending or not merged:
             log.info("All tracked matches finished - stopping."); return
         if t0 - start > MAX_RUN:
-            handover({k: list(v) for k, v in scores.items()}, done); return
-        active = sorted({matched[i]["lg"] for i in pending
-                         if matched[i]["kickoff"] - timedelta(minutes=10) <= now
-                         <= matched[i]["kickoff"] + timedelta(hours=3)})
+            handover(scores, done, seen); return
+        if not any(s <= now <= e for s, e in merged):          # between matches: sleep, no requests
+            nxt = min((s for s, _ in merged if s > now), default=None)
+            if nxt is None:
+                log.info("No more match windows today - stopping."); return
+            time.sleep(min(30.0, max(1.0, (nxt - now).total_seconds()))); continue
+        if budget_left() <= 2:
+            tg_send("⛔ Daily API-Football requests used up - no more alerts today.")
+            return
         try:
-            def grab(lg):
-                try:
-                    return [p for p in (parse(e) for e in fetch_board(lg, day)) if p]
-                except Exception as ex:
-                    log.warning("%s fetch failed: %s", lg, ex); return None
-            if active:
-                with ThreadPoolExecutor(max_workers=len(active)) as ex:
-                    results = list(ex.map(grab, active))
-                if all(r is None for r in results):
-                    raise RuntimeError("all ESPN requests failed")
-                fails = 0; polls += 1
-                for events in results:
-                    for e in events or []:
-                        eid = e["id"]
-                        if eid not in matched or eid in done:
-                            continue
-                        info, cur = matched[eid], (e["hs"], e["as"])
-                        if e["state"] == "pre":
-                            continue
-                        if e["state"] == "in" or e["state"] == "post":
-                            if eid not in scores:
-                                scores[eid] = cur if silent else (0, 0)
-                            prev = scores[eid]
-                            if cur[0] > prev[0] or cur[1] > prev[1]:
-                                goal_alert(e, info, prev, cur, day)
-                            elif cur[0] < prev[0] or cur[1] < prev[1]:
-                                correction_alert(info, prev, cur)
-                            scores[eid] = cur
-                        if e["state"] == "post":
-                            if e["tname"] in ("STATUS_POSTPONED", "STATUS_CANCELED"):
-                                tg_send(f"⏸ {html.escape(info['home'])} v {html.escape(info['away'])}: "
-                                        f"{e['tname'].replace('STATUS_', '').title()}")
-                            elif FT_ALERTS and not silent:
-                                tg_send(f"🏁 <b>FT</b>  {html.escape(info['home'])} <b>{cur[0]} – {cur[1]}</b> {html.escape(info['away'])}")
-                            done.add(eid)
-                silent = False
-                if polls % 100 == 0:
-                    log.info("polls=%s active=%s", polls, active)
+            live = {f["fixture"]["id"]: f for f in api_get("fixtures", {"live": "all"})["response"]
+                    if f["fixture"]["id"] in matched}
+            for fid, f in live.items():
+                cur = (f["goals"]["home"] or 0, f["goals"]["away"] or 0)
+                seen.add(fid); miss_strikes.pop(fid, None)
+                if fid not in scores:
+                    scores[fid] = cur if silent else (0, 0)
+                prev = scores[fid]
+                if cur[0] > prev[0] or cur[1] > prev[1]:
+                    goal_alert(f, matched[fid], prev, cur)
+                elif cur[0] < prev[0] or cur[1] < prev[1]:
+                    correction_alert(matched[fid], prev, cur)
+                scores[fid] = cur
+            silent = False
+            gone = [fid for fid in seen - done if fid not in live]
+            for i in range(0, len(gone), 20):                  # one batched lookup per poll
+                chunk = gone[i:i + 20]
+                res = {f["fixture"]["id"]: f for f in
+                       api_get("fixtures", {"ids": "-".join(map(str, chunk))})["response"]}
+                for fid in chunk:
+                    f = res.get(fid)
+                    if f and f["fixture"]["status"].get("short") in FINAL:
+                        cur = (f["goals"]["home"] or 0, f["goals"]["away"] or 0)
+                        prev = scores.get(fid, (0, 0)); info = matched[fid]
+                        if cur[0] > prev[0] or cur[1] > prev[1]:
+                            goal_alert(f, info, prev, cur)
+                        if FT_ALERTS:
+                            tg_send(f"🏁 <b>FT</b>  {html.escape(info['home'])} <b>{cur[0]} – {cur[1]}</b> {html.escape(info['away'])}")
+                        scores[fid] = cur; done.add(fid)
+                    else:
+                        miss_strikes[fid] = miss_strikes.get(fid, 0) + 1
+                        if miss_strikes[fid] >= 3:
+                            done.add(fid)
+        except PermissionError as e:
+            tg_send(f"❌ Goal tracker stopped: {html.escape(str(e))}"); raise
         except Exception as e:
-            fails += 1; log.error("poll failed: %s", e)
-            if fails == 10:
-                tg_send("⚠️ Goal tracker: 10 failed polls in a row - ESPN feed may be down or changed.")
-        time.sleep(max(0.0, POLL - (time.time() - t0)))
+            log.error("poll failed: %s", e)
+        iv = next_interval(windows(matched, done), datetime.now(timezone.utc))
+        log.info("requests left=%s next check in %.0fs", budget_left(), iv)
+        time.sleep(max(0.0, iv - (time.time() - t0)))
 
 if __name__ == "__main__":
     main()
