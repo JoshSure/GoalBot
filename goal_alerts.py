@@ -309,4 +309,36 @@ def main():
                 prev = scores[fid]
                 if cur[0] > prev[0] or cur[1] > prev[1]:
                     goal_alert(f, matched[fid], prev, cur)
-                elif cur[0] < prev[
+                elif cur[0] < prev[0] or cur[1] < prev[1]:
+                    correction_alert(matched[fid], prev, cur)
+                scores[fid] = cur
+            silent = False
+            gone = [fid for fid in seen - done if fid not in live]
+            for i in range(0, len(gone), 20):                  # one batched lookup per poll
+                chunk = gone[i:i + 20]
+                res = {f["fixture"]["id"]: f for f in
+                       api_get("fixtures", {"ids": "-".join(map(str, chunk))})["response"]}
+                for fid in chunk:
+                    f = res.get(fid)
+                    if f and f["fixture"]["status"].get("short") in FINAL:
+                        cur = (f["goals"]["home"] or 0, f["goals"]["away"] or 0)
+                        prev = scores.get(fid, (0, 0)); info = matched[fid]
+                        if cur[0] > prev[0] or cur[1] > prev[1]:
+                            goal_alert(f, info, prev, cur)
+                        if FT_ALERTS:
+                            tg_send(f"🏁 <b>FT</b>  {html.escape(info['home'])} <b>{cur[0]} – {cur[1]}</b> {html.escape(info['away'])}")
+                        scores[fid] = cur; done.add(fid)
+                    else:
+                        miss_strikes[fid] = miss_strikes.get(fid, 0) + 1
+                        if miss_strikes[fid] >= 3:
+                            done.add(fid)
+        except PermissionError as e:
+            tg_send(f"❌ Goal tracker stopped: {html.escape(str(e))}"); raise
+        except Exception as e:
+            log.error("poll failed: %s", e)
+        iv = next_interval(windows(matched, done), datetime.now(timezone.utc))
+        log.info("requests left=%s next check in %.0fs", budget_left(), iv)
+        time.sleep(max(0.0, iv - (time.time() - t0)))
+
+if __name__ == "__main__":
+    main()
