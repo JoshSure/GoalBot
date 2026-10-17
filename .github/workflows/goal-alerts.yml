@@ -2,7 +2,7 @@ name: goal-alerts
 
 on:
   schedule:
-    - cron: "30 10 * * *"        # 10:30 UTC daily (13:30 Nairobi); script waits for first kickoff
+    - cron: "30 10 * * *"        # 10:30 UTC daily; the script waits quietly until just before the first match
   workflow_dispatch:
     inputs:
       state:
@@ -31,4 +31,3 @@ jobs:
           FOOTBALL_CHAT_ID: ${{ secrets.FOOTBALL_CHAT_ID }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           HANDOVER_STATE: ${{ github.event.inputs.state }}
-          POLL_SECONDS: "20"
