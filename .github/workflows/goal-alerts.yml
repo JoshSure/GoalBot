@@ -1,0 +1,34 @@
+name: goal-alerts
+
+on:
+  schedule:
+    - cron: "30 10 * * *"        # 10:30 UTC daily (13:30 Nairobi); script waits for first kickoff
+  workflow_dispatch:
+    inputs:
+      state:
+        description: "Internal hand-over state (leave empty when starting manually)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  actions: write                 # lets a run start its own successor before the 6h cap
+
+jobs:
+  track:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install requests
+      - run: python goal_alerts.py
+        env:
+          API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          FOOTBALL_CHAT_ID: ${{ secrets.FOOTBALL_CHAT_ID }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HANDOVER_STATE: ${{ github.event.inputs.state }}
+          POLL_SECONDS: "20"
