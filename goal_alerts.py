@@ -12,7 +12,7 @@ How the free budget is stretched
 * Scorers come from the same live response (no extra request per goal).
 * A finished match costs one batched lookup for its final score.
 """
-import csv, html, json, logging, os, re, threading, time, unicodedata
+import csv, html, io, json, logging, os, re, threading, time, unicodedata
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 
@@ -116,19 +116,52 @@ def best_fixture(home, away, fixtures):
     return best
 
 # ------------------------------------------------------------ tracked list
-def load_tracked(path, day):
-    out = []
-    with open(path, newline="", encoding="utf-8-sig") as fh:
-        rows = list(csv.reader(fh))
-    head = [h.strip().lower() for h in rows[0]]
+SHEET_URL = os.environ.get("SHEET_CSV_URL", "").strip()
+_sheet = {"rows": 0, "skipped": 0}
+DT_FORMATS = ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M")
+
+def read_rows():
+    """Rows from the published Google Sheet (SHEET_CSV_URL) or, if unset, the repo CSV file."""
+    if SHEET_URL:
+        r = requests.get(SHEET_URL, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+        r.raise_for_status()
+        text = r.content.decode("utf-8-sig")
+        if text.lstrip()[:15].lower().startswith(("<!doctype", "<html")):
+            raise RuntimeError("Google returned a web page instead of CSV - the sheet link is not "
+                               "published/public (File > Share > Publish to web > CSV)")
+        return list(csv.reader(io.StringIO(text)))
+    with open(CSV_PATH, newline="", encoding="utf-8-sig") as fh:
+        return list(csv.reader(fh))
+
+def parse_dt(text):
+    text = text.strip()
+    for fmt in DT_FORMATS:
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            pass
+    return None
+
+def load_tracked(day):
+    rows = read_rows()
+    hi = next((i for i, r in enumerate(rows)
+               if any("league" in c.lower() for c in r) and any("home" in c.lower() for c in r)), None)
+    if hi is None:
+        raise RuntimeError("Could not find the header row (League / Date / Home / Away) in the sheet")
+    head = [h.strip().lower() for h in rows[hi]]
     ci = lambda key: next(i for i, h in enumerate(head) if key in h)
     c_lg, c_dt, c_h, c_a = ci("league"), ci("date"), ci("home"), ci("away")
     clean = lambda s: re.sub(r"\s*\(.*$", "", s).strip()
-    for r in rows[1:]:
+    out = []
+    _sheet["rows"] = _sheet["skipped"] = 0
+    for r in rows[hi + 1:]:
         if len(r) <= max(c_lg, c_dt, c_h, c_a) or not r[c_h].strip():
             continue
-        ko = datetime.strptime(r[c_dt].strip()[:16], "%Y-%m-%d %H:%M") - timedelta(hours=CSV_UTC_OFFSET)
-        ko = ko.replace(tzinfo=timezone.utc)
+        _sheet["rows"] += 1
+        ko = parse_dt(r[c_dt])
+        if ko is None:
+            _sheet["skipped"] += 1; continue
+        ko = (ko - timedelta(hours=CSV_UTC_OFFSET)).replace(tzinfo=timezone.utc)
         if ko.date() == day:
             out.append({"league": r[c_lg].strip(), "kickoff": ko,
                         "home": clean(r[c_h]), "away": clean(r[c_a])})
@@ -218,9 +251,16 @@ def main():
         day = datetime.strptime(os.environ["TRACK_DATE"], "%Y-%m-%d").date()
     state = json.loads(os.environ.get("HANDOVER_STATE") or "{}")
     _used["n"] = state.get("used", 0)
-    tracked = load_tracked(CSV_PATH, day)
+    try:
+        tracked = load_tracked(day)
+    except Exception as e:
+        tg_send(f"❌ <b>Goal tracker could not read your fixtures</b>\n{html.escape(str(e))}")
+        raise
     if not tracked:
-        log.info("No tracked matches for %s - nothing to do.", day); return
+        log.info("No tracked matches for %s - nothing to do.", day)
+        if _sheet["skipped"] and _sheet["skipped"] == _sheet["rows"] and not state:
+            tg_send("⚠️ Goal tracker: could not read any dates in the sheet - check the Date / Time format.")
+        return
     try:
         matched, missing = resolve(tracked, day)
     except Exception as e:
@@ -230,7 +270,8 @@ def main():
     scores = {int(k): tuple(v) for k, v in state.get("scores", {}).items()}
     if not state:
         iv = next_interval(windows(matched, done), datetime.now(timezone.utc))
-        msg = (f"✅ <b>Goal tracker started</b> — {len(matched)}/{len(tracked)} matches linked.\n"
+        msg = (f"✅ <b>Goal tracker started</b> — {len(matched)}/{len(tracked)} matches linked "
+               f"({_sheet['rows']} sheet rows read).\n"
                f"API requests left today: {budget_left()} · checking about every {iv/60:.1f} min")
         if missing:
             msg += "\n⚠️ Not found in feed:\n" + "\n".join(html.escape(m) for m in missing)
@@ -268,36 +309,4 @@ def main():
                 prev = scores[fid]
                 if cur[0] > prev[0] or cur[1] > prev[1]:
                     goal_alert(f, matched[fid], prev, cur)
-                elif cur[0] < prev[0] or cur[1] < prev[1]:
-                    correction_alert(matched[fid], prev, cur)
-                scores[fid] = cur
-            silent = False
-            gone = [fid for fid in seen - done if fid not in live]
-            for i in range(0, len(gone), 20):                  # one batched lookup per poll
-                chunk = gone[i:i + 20]
-                res = {f["fixture"]["id"]: f for f in
-                       api_get("fixtures", {"ids": "-".join(map(str, chunk))})["response"]}
-                for fid in chunk:
-                    f = res.get(fid)
-                    if f and f["fixture"]["status"].get("short") in FINAL:
-                        cur = (f["goals"]["home"] or 0, f["goals"]["away"] or 0)
-                        prev = scores.get(fid, (0, 0)); info = matched[fid]
-                        if cur[0] > prev[0] or cur[1] > prev[1]:
-                            goal_alert(f, info, prev, cur)
-                        if FT_ALERTS:
-                            tg_send(f"🏁 <b>FT</b>  {html.escape(info['home'])} <b>{cur[0]} – {cur[1]}</b> {html.escape(info['away'])}")
-                        scores[fid] = cur; done.add(fid)
-                    else:
-                        miss_strikes[fid] = miss_strikes.get(fid, 0) + 1
-                        if miss_strikes[fid] >= 3:
-                            done.add(fid)
-        except PermissionError as e:
-            tg_send(f"❌ Goal tracker stopped: {html.escape(str(e))}"); raise
-        except Exception as e:
-            log.error("poll failed: %s", e)
-        iv = next_interval(windows(matched, done), datetime.now(timezone.utc))
-        log.info("requests left=%s next check in %.0fs", budget_left(), iv)
-        time.sleep(max(0.0, iv - (time.time() - t0)))
-
-if __name__ == "__main__":
-    main()
+                elif cur[0] < prev[
