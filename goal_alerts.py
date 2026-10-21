@@ -3,14 +3,11 @@
 Goal alerts: API-Football -> Telegram. Works on the FREE plan (100 requests/day)
 and automatically polls faster on paid plans.
 
-How the free budget is stretched
-  * ONE request per check (fixtures?live=all) - never one request per match.
-  * Checks only happen while a tracked match can be in play (kick-off -2min .. +2h05).
-  * The gap between checks is recalculated every time:
-        seconds of match-time still ahead / API requests still left today
-    so the whole day's requests are spread across the whole day (~every 5-6 min on 100/day).
-  * Scorers come from the same live response (no extra request per goal).
-  * A finished match costs one batched lookup for its final score.
+Optimized Budget Strategy (Safe for Free Tier):
+  * Hard minimum polling interval of 2.5 minutes (never burns quota in 20-second bursts).
+  * Automatically slows down if the remaining request count gets low.
+  * ONE batched request per check (fixtures?live=all).
+  * Throttled lookup for finished matches.
 """
 import csv, html, io, json, logging, os, re, threading, time, unicodedata
 from datetime import datetime, timedelta, timezone
@@ -21,14 +18,17 @@ API_BASE = "https://v3.football.api-sports.io"
 API_KEY = os.environ.get("API_FOOTBALL_KEY", "")
 TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT = os.environ.get("FOOTBALL_CHAT_ID", "")
-MIN_POLL = float(os.environ.get("MIN_POLL_SECONDS", "20"))      # fastest allowed (paid plans)
-MAX_POLL = float(os.environ.get("MAX_POLL_SECONDS", "600"))     # slowest allowed
-DAILY_LIMIT = int(os.environ.get("DAILY_LIMIT", "100"))         # used only if the API sends no header
-RESERVE = int(os.environ.get("RESERVE_REQUESTS", "10"))         # kept back for final-score lookups
+
+# SAFE DEFAULTS FOR 100 CALLS/DAY:
+# Minimum wait: 150s (2.5 mins). Maximum wait: 360s (6 mins).
+MIN_POLL = float(os.environ.get("MIN_POLL_SECONDS", "150"))
+MAX_POLL = float(os.environ.get("MAX_POLL_SECONDS", "360"))
+DAILY_LIMIT = int(os.environ.get("DAILY_LIMIT", "100"))
+RESERVE = int(os.environ.get("RESERVE_REQUESTS", "10"))
 MAX_RUN = float(os.environ.get("MAX_RUNTIME_MIN", "340")) * 60
+
 CSV_PATH = os.environ.get("CSV_PATH", "tracked_matches.csv")
-# Times in the CSV / sheet are read as this UTC offset. Kenya (EAT) = UTC+3, so default is 3.
-# Override with the CSV_UTC_OFFSET_HOURS environment variable if ever needed.
+# Times in CSV/sheet are read as Kenyan Time (EAT = UTC+3)
 CSV_UTC_OFFSET = float(os.environ.get("CSV_UTC_OFFSET_HOURS", "3"))
 FT_ALERTS = os.environ.get("FT_ALERTS", "1") == "1"
 MIN_SIDE, MIN_AVG = 0.78, 0.82
@@ -38,6 +38,7 @@ log = logging.getLogger("goals")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
 _used = {"n": 0}
 _remaining = {"v": None}
+_last_ft_check = 0.0
 
 
 # ------------------------------------------------------------------ helpers
@@ -76,7 +77,7 @@ def tg_send(text):
         r = requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
                           json={"chat_id": TG_CHAT, "text": text, "parse_mode": "HTML",
                                 "disable_web_page_preview": True}, timeout=10)
-        return r.json()["result"]["message_id"]
+        return r.json().get("result", {}).get("message_id")
     except Exception as e:
         log.error("telegram send failed: %s", e)
 
@@ -90,7 +91,6 @@ ALIAS = {"internazionale milano": "inter", "internazionale": "inter", "inter mil
          "west bromwich albion": "west brom", "queens park rangers": "qpr",
          "paris saint germain": "psg", "borussia monchengladbach": "gladbach",
          "hamburger": "hamburg", "racing lens": "lens",
-         # added: French clubs whose official names differ from the API-Football names
          "stade rennais": "rennes", "olympique lyonnais": "lyon",
          "olympique marseille": "marseille", "wolverhampton wanderers": "wolves"}
 
@@ -135,14 +135,14 @@ DT_FORMATS = ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S", "%Y-%m
 
 
 def read_rows():
-    """Rows from the published Google Sheet (SHEET_CSV_URL) or, if unset, the repo CSV file."""
+    """Rows from published Google Sheet (SHEET_CSV_URL) or repository CSV file."""
     if SHEET_URL:
         r = requests.get(SHEET_URL, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
         r.raise_for_status()
         text = r.content.decode("utf-8-sig")
         if text.lstrip()[:15].lower().startswith(("<!doctype", "<html")):
-            raise RuntimeError("Google returned a web page instead of CSV - the sheet link is not "
-                               "published/public (File > Share > Publish to web > CSV)")
+            raise RuntimeError("Google returned a web page instead of CSV - ensure sheet link is "
+                               "published (File > Share > Publish to web > CSV)")
         return list(csv.reader(io.StringIO(text)))
     with open(CSV_PATH, newline="", encoding="utf-8-sig") as fh:
         return list(csv.reader(fh))
@@ -163,7 +163,7 @@ def load_tracked(day):
     hi = next((i for i, r in enumerate(rows)
                if any("league" in c.lower() for c in r) and any("home" in c.lower() for c in r)), None)
     if hi is None:
-        raise RuntimeError("Could not find the header row (League / Date / Home / Away) in the sheet")
+        raise RuntimeError("Could not find header row (League / Date / Home / Away) in sheet")
     head = [h.strip().lower() for h in rows[hi]]
     ci = lambda key: next(i for i, h in enumerate(head) if key in h)
     c_lg, c_dt, c_h, c_a = ci("league"), ci("date"), ci("home"), ci("away")
@@ -200,7 +200,7 @@ def resolve(tracked, day):
 
 # ------------------------------------------------- budget-aware scheduling
 def windows(matched, done):
-    w = sorted((m["kickoff"] - timedelta(minutes=2), m["kickoff"] + timedelta(minutes=125))
+    w = sorted((m["kickoff"] - timedelta(minutes=2), m["kickoff"] + timedelta(minutes=130))
                for i, m in matched.items() if i not in done)
     merged = []
     for s, e in w:
@@ -216,8 +216,15 @@ def active_left(merged, now):
 
 
 def next_interval(merged, now):
-    budget = max(1, budget_left() - RESERVE)
-    return min(MAX_POLL, max(MIN_POLL, active_left(merged, now) / budget))
+    rem = budget_left()
+    # Safety: If running very low on quota, automatically slow down to MAX_POLL
+    if rem <= RESERVE + 2:
+        return MAX_POLL
+
+    budget = max(1, rem - RESERVE)
+    calc = active_left(merged, now) / budget
+    # Always stay within safe boundaries (150s - 360s)
+    return min(MAX_POLL, max(MIN_POLL, calc))
 
 
 # ----------------------------------------------------------------- alerts
@@ -271,6 +278,7 @@ def handover(scores, done, seen):
 
 # -------------------------------------------------------------------- main
 def main():
+    global _last_ft_check
     start = time.time()
     day = datetime.now(timezone.utc).date()
     if os.environ.get("TRACK_DATE"):
@@ -305,25 +313,38 @@ def main():
     if not matched:
         return
     silent = not state
-    miss_strikes, warned = {}, False
+    miss_strikes = {}
+
     while True:
         t0 = time.time()
         now = datetime.now(timezone.utc)
         pending = {i for i in matched if i not in done}
         merged = windows(matched, done)
+
+        # All games finished
         if not pending or not merged:
             log.info("All tracked matches finished - stopping."); return
+
+        # Approaching GitHub Actions 6hr limit -> trigger clean handover
         if t0 - start > MAX_RUN:
             handover(scores, done, seen); return
-        if not any(s <= now <= e for s, e in merged):   # between matches: sleep, no requests
+
+        # Between matches: sleep without making requests
+        if not any(s <= now <= e for s, e in merged):
             nxt = min((s for s, _ in merged if s > now), default=None)
             if nxt is None:
                 log.info("No more match windows today - stopping."); return
-            time.sleep(min(30.0, max(1.0, (nxt - now).total_seconds()))); continue
+            # Sleep in chunks up to 60s while waiting for next kickoff
+            time.sleep(min(60.0, max(5.0, (nxt - now).total_seconds())))
+            continue
+
+        # Budget exhaustion guard
         if budget_left() <= 2:
             tg_send("⛔ Daily API-Football requests used up - no more alerts today.")
             return
+
         try:
+            # 1. Check active live matches
             live = {f["fixture"]["id"]: f for f in api_get("fixtures", {"live": "all"})["response"]
                     if f["fixture"]["id"] in matched}
             for fid, f in live.items():
@@ -338,29 +359,36 @@ def main():
                     correction_alert(matched[fid], prev, cur)
                 scores[fid] = cur
             silent = False
+
+            # 2. Throttled check for matches that recently ended
+            # Only checks finished lookups at most once every 3 minutes to save quota
             gone = [fid for fid in seen - done if fid not in live]
-            for i in range(0, len(gone), 20):           # one batched lookup per poll
-                chunk = gone[i:i + 20]
-                res = {f["fixture"]["id"]: f for f in
-                       api_get("fixtures", {"ids": "-".join(map(str, chunk))})["response"]}
-                for fid in chunk:
-                    f = res.get(fid)
-                    if f and f["fixture"]["status"].get("short") in FINAL:
-                        cur = (f["goals"]["home"] or 0, f["goals"]["away"] or 0)
-                        prev = scores.get(fid, (0, 0)); info = matched[fid]
-                        if cur[0] > prev[0] or cur[1] > prev[1]:
-                            goal_alert(f, info, prev, cur)
-                        if FT_ALERTS:
-                            tg_send(f"🏁 <b>FT</b> {html.escape(info['home'])} <b>{cur[0]} – {cur[1]}</b> {html.escape(info['away'])}")
-                        scores[fid] = cur; done.add(fid)
-                    else:
-                        miss_strikes[fid] = miss_strikes.get(fid, 0) + 1
-                        if miss_strikes[fid] >= 3:
-                            done.add(fid)
+            if gone and (time.time() - _last_ft_check > 180) and budget_left() > RESERVE:
+                _last_ft_check = time.time()
+                for i in range(0, len(gone), 20):
+                    chunk = gone[i:i + 20]
+                    res = {f["fixture"]["id"]: f for f in
+                           api_get("fixtures", {"ids": "-".join(map(str, chunk))})["response"]}
+                    for fid in chunk:
+                        f = res.get(fid)
+                        if f and f["fixture"]["status"].get("short") in FINAL:
+                            cur = (f["goals"]["home"] or 0, f["goals"]["away"] or 0)
+                            prev = scores.get(fid, (0, 0)); info = matched[fid]
+                            if cur[0] > prev[0] or cur[1] > prev[1]:
+                                goal_alert(f, info, prev, cur)
+                            if FT_ALERTS:
+                                tg_send(f"🏁 <b>FT</b> {html.escape(info['home'])} <b>{cur[0]} – {cur[1]}</b> {html.escape(info['away'])}")
+                            scores[fid] = cur; done.add(fid)
+                        else:
+                            miss_strikes[fid] = miss_strikes.get(fid, 0) + 1
+                            if miss_strikes[fid] >= 3:
+                                done.add(fid)
+
         except PermissionError as e:
             tg_send(f"❌ Goal tracker stopped: {html.escape(str(e))}"); raise
         except Exception as e:
             log.error("poll failed: %s", e)
+
         iv = next_interval(windows(matched, done), datetime.now(timezone.utc))
         log.info("requests left=%s next check in %.0fs", budget_left(), iv)
         time.sleep(max(0.0, iv - (time.time() - t0)))
