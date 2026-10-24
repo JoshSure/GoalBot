@@ -3,11 +3,15 @@
 Goal alerts: API-Football -> Telegram. Works on the FREE plan (100 requests/day)
 and automatically polls faster on paid plans.
 
-Optimized Budget Strategy (Safe for Free Tier):
-  * Hard minimum polling interval of 2.5 minutes (never burns quota in 20-second bursts).
-  * Automatically slows down if the remaining request count gets low.
+Budget strategy:
+  * The polling interval is purely budget-driven: remaining usable requests are
+    spread evenly across the remaining live match time, recalculated every loop.
+    If matches end early or fewer requests were used, polling speeds up
+    automatically, so the day's allocation is used up by the final whistle.
+  * A small reserve is kept back for full-time lookups.
   * ONE batched request per check (fixtures?live=all).
-  * Throttled lookup for finished matches.
+  * Matches that drop out of the live feed but are still in play are re-checked
+    (throttled) so goals are not missed and tracking is not abandoned.
 """
 import csv, html, io, json, logging, os, re, threading, time, unicodedata
 from datetime import datetime, timedelta, timezone
@@ -19,13 +23,14 @@ API_KEY = os.environ.get("API_FOOTBALL_KEY", "")
 TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT = os.environ.get("FOOTBALL_CHAT_ID", "")
 
-# SAFE DEFAULTS FOR 100 CALLS/DAY:
-# Minimum wait: 150s (2.5 mins). Maximum wait: 360s (6 mins).
-MIN_POLL = float(os.environ.get("MIN_POLL_SECONDS", "150"))
-MAX_POLL = float(os.environ.get("MAX_POLL_SECONDS", "360"))
+# Floor only matters when you have lots of quota (paid plans). There is no ceiling.
+MIN_POLL = float(os.environ.get("MIN_POLL_SECONDS", "20"))
 DAILY_LIMIT = int(os.environ.get("DAILY_LIMIT", "100"))
-RESERVE = int(os.environ.get("RESERVE_REQUESTS", "10"))
+RESERVE = int(os.environ.get("RESERVE_REQUESTS", "5"))
 MAX_RUN = float(os.environ.get("MAX_RUNTIME_MIN", "340")) * 60
+# Minutes after kickoff a match window stays open (150 covers extra time;
+# use 190 if you track cup knockouts with penalties).
+WINDOW_MIN = float(os.environ.get("WINDOW_MINUTES", "150"))
 
 CSV_PATH = os.environ.get("CSV_PATH", "tracked_matches.csv")
 # Times in CSV/sheet are read as Kenyan Time (EAT = UTC+3)
@@ -33,6 +38,7 @@ CSV_UTC_OFFSET = float(os.environ.get("CSV_UTC_OFFSET_HOURS", "3"))
 FT_ALERTS = os.environ.get("FT_ALERTS", "1") == "1"
 MIN_SIDE, MIN_AVG = 0.78, 0.82
 FINAL = {"FT", "AET", "PEN", "AWD", "WO", "PST", "CANC", "ABD"}
+INPLAY = {"1H", "HT", "2H", "ET", "BT", "P", "LIVE", "INT", "SUSP"}
 
 log = logging.getLogger("goals")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
@@ -65,6 +71,7 @@ def api_get(path, params=None, tries=3):
             if i == tries - 1:
                 raise
             log.warning("api retry (%s)", e); time.sleep(2 * (i + 1))
+    raise RuntimeError("rate limited (429) after retries")
 
 
 def budget_left():
@@ -200,7 +207,7 @@ def resolve(tracked, day):
 
 # ------------------------------------------------- budget-aware scheduling
 def windows(matched, done):
-    w = sorted((m["kickoff"] - timedelta(minutes=2), m["kickoff"] + timedelta(minutes=130))
+    w = sorted((m["kickoff"] - timedelta(minutes=2), m["kickoff"] + timedelta(minutes=WINDOW_MIN))
                for i, m in matched.items() if i not in done)
     merged = []
     for s, e in w:
@@ -216,15 +223,12 @@ def active_left(merged, now):
 
 
 def next_interval(merged, now):
-    rem = budget_left()
-    # Safety: If running very low on quota, automatically slow down to MAX_POLL
-    if rem <= RESERVE + 2:
-        return MAX_POLL
-
-    budget = max(1, rem - RESERVE)
-    calc = active_left(merged, now) / budget
-    # Always stay within safe boundaries (150s - 360s)
-    return min(MAX_POLL, max(MIN_POLL, calc))
+    """Spread the remaining usable requests evenly over the remaining live time.
+    Recalculated every loop, so unused quota speeds up later polling and the
+    day's allocation is used up by the end of the last match."""
+    # Keep requests back for full-time lookups: ~2 per match window
+    spare = max(1, budget_left() - RESERVE - 2 * len(merged))
+    return max(MIN_POLL, active_left(merged, now) / spare)
 
 
 # ----------------------------------------------------------------- alerts
@@ -344,7 +348,7 @@ def main():
             return
 
         try:
-            # 1. Check active live matches
+            # 1. Check active live matches (one batched request)
             live = {f["fixture"]["id"]: f for f in api_get("fixtures", {"live": "all"})["response"]
                     if f["fixture"]["id"] in matched}
             for fid, f in live.items():
@@ -360,8 +364,8 @@ def main():
                 scores[fid] = cur
             silent = False
 
-            # 2. Throttled check for matches that recently ended
-            # Only checks finished lookups at most once every 3 minutes to save quota
+            # 2. Throttled check for matches that dropped out of the live feed.
+            # Looked up at most once every 3 minutes to save quota.
             gone = [fid for fid in seen - done if fid not in live]
             if gone and (time.time() - _last_ft_check > 180) and budget_left() > RESERVE:
                 _last_ft_check = time.time()
@@ -371,7 +375,8 @@ def main():
                            api_get("fixtures", {"ids": "-".join(map(str, chunk))})["response"]}
                     for fid in chunk:
                         f = res.get(fid)
-                        if f and f["fixture"]["status"].get("short") in FINAL:
+                        st = ((f or {}).get("fixture", {}).get("status", {}) or {}).get("short")
+                        if f and st in FINAL:
                             cur = (f["goals"]["home"] or 0, f["goals"]["away"] or 0)
                             prev = scores.get(fid, (0, 0)); info = matched[fid]
                             if cur[0] > prev[0] or cur[1] > prev[1]:
@@ -379,6 +384,16 @@ def main():
                             if FT_ALERTS:
                                 tg_send(f"🏁 <b>FT</b> {html.escape(info['home'])} <b>{cur[0]} – {cur[1]}</b> {html.escape(info['away'])}")
                             scores[fid] = cur; done.add(fid)
+                            miss_strikes.pop(fid, None)
+                        elif f and st in INPLAY:
+                            # Still being played but missing from the live feed:
+                            # keep tracking and catch any goals.
+                            miss_strikes.pop(fid, None)
+                            cur = (f["goals"]["home"] or 0, f["goals"]["away"] or 0)
+                            prev = scores.get(fid, (0, 0))
+                            if cur[0] > prev[0] or cur[1] > prev[1]:
+                                goal_alert(f, matched[fid], prev, cur)
+                            scores[fid] = cur
                         else:
                             miss_strikes[fid] = miss_strikes.get(fid, 0) + 1
                             if miss_strikes[fid] >= 3:
