@@ -2,7 +2,7 @@ name: goal-alerts
 
 on:
   schedule:
-    - cron: "15 10 * * *"        # 10:15 UTC daily; the script waits quietly until just before the first match
+    - cron: "0 7 * * *"         # 07:00 UTC = 10:00 Kenyan time, daily; the script waits quietly until just before the first match
   workflow_dispatch:
     inputs:
       state:
